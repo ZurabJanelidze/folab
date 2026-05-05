@@ -1,5 +1,5 @@
 """
-folab.py
+fol.py
 
 Clean proof-checking engine for bracket-language first-order logic.
 
@@ -23,6 +23,7 @@ Typical use:
 
     P = Proof(L)
     G = Proof(P, goal="for every [x] we have [[P[x]] implies [P[x]]]")
+    G.assume("x")
     H = Proof(G, goal="[P[x]] implies [P[x]]")
     H.assume("P[x]")
     H.conclude("P[x]")
@@ -32,7 +33,8 @@ Typical use:
 Important correction:
     Equality introduction no longer creates variables. A line such as [x]=[x]
     is accepted only if x is already active. A variable is active if it is
-    contextual, or if it has been introduced locally by an active universal goal.
+    contextual, or if it has been introduced by an explicit object-assumption
+    line such as ASSUME x inside the current proof path.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional, Literal
 
 
-LineKind = Literal["assumption", "conclusion", "goal"]
+LineKind = Literal["assumption", "object_assumption", "conclusion", "goal"]
 
 
 class ProofError(Exception):
@@ -823,6 +825,7 @@ class Proof:
 
         label = {
             "assumption": "Assume",
+            "object_assumption": "Assume",
             "conclusion": "Conclude",
             "goal": "Goal",
         }[kind]
@@ -850,6 +853,25 @@ class Proof:
 
     def local_assumptions(self) -> list[str]:
         return [line.formula for line in self.lines if line.kind == "assumption"]
+
+    def local_object_assumptions(self) -> list[str]:
+        return [line.formula for line in self.lines if line.kind == "object_assumption"]
+
+    def object_assumptions_on_active_path(self) -> set[str]:
+        """
+        Object variables introduced by explicit object-assumption lines on the
+        current active proof path.
+        """
+        out: set[str] = set()
+
+        if self.parent is not None:
+            out |= self.parent.object_assumptions_on_active_path()
+
+        for line in self.lines:
+            if line.kind == "object_assumption":
+                out.add(line.formula)
+
+        return out
 
     def local_conclusions(self) -> list[str]:
         """
@@ -879,23 +901,10 @@ class Proof:
 
         This includes:
         1. contextual variables, from available formulas;
-        2. variables introduced locally by active universal goals.
+        2. variables introduced by explicit object-assumption lines on the
+           current active proof path.
         """
-        out = set(self.contextual_variables())
-
-        proof: Optional[Proof] = self
-        while proof is not None:
-            if proof.goal_formula is not None:
-                try:
-                    template, children = decompose_top_level(proof.goal_formula)
-                    if template == proof.language.FORALL and len(children) == 2:
-                        out.add(children[0])
-                except Exception:
-                    pass
-
-            proof = proof.parent
-
-        return out
+        return set(self.contextual_variables()) | self.object_assumptions_on_active_path()
 
     def _in_context(self, formula: str) -> bool:
         return norm(formula) in self.available_formulas()
@@ -906,10 +915,33 @@ class Proof:
 
     # -------------------------- User commands -----------------------------
 
-    def assume(self, formula: str) -> Line:
-        formula = norm(formula)
-        self._require_formula(formula)
-        return self._add_line("assumption", formula, rule="assumption")
+    def assume(self, item: str) -> Line:
+        """
+        Add an assumption line.
+
+        If item is a formula, this is an ordinary formula assumption.
+        If item is a declared variable, this is an object-assumption line,
+        meaning that the variable is introduced as a local arbitrary object.
+        """
+        item = norm(item)
+
+        if self.language.is_formula(item):
+            return self._add_line("assumption", item, rule="assumption")
+
+        if self.language.is_variable(item):
+            if item in self.active_variables():
+                raise ProofError(
+                    f"Variable {item!r} is already active and cannot be introduced again."
+                )
+            return self._add_line(
+                "object_assumption",
+                item,
+                rule="assumption",
+            )
+
+        raise ProofError(
+            f"Assumption must be either a formula or a declared variable: {item!r}"
+        )
 
     def conclude(self, formula: str, *, rule: Optional[str] = None, **kwargs: str) -> Line:
         formula = norm(formula)
@@ -1511,7 +1543,13 @@ class Proof:
 
             if subproof.local_assumptions():
                 raise ProofError(
-                    "Universal-introduction subproof must not introduce assumptions."
+                    "Universal-introduction subproof must not introduce formula assumptions."
+                )
+
+            if subproof.local_object_assumptions() != [x]:
+                raise ProofError(
+                    "Universal-introduction subproof must begin by assuming "
+                    "the quantified variable as its object assumption."
                 )
 
             if A not in subproof.local_conclusions():
